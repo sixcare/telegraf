@@ -28,17 +28,27 @@ type AlertaStats struct {
 }
 
 type AlertaMetric struct {
-	Group string `json:"group"`
-	Name  string `json:"name"`
-	Type  string `json:"type"`
-	Value int64  `json:"value"`
-	Count int64  `json:"count"`
+	Group     string `json:"group"`
+	Name      string `json:"name"`      // Action
+	Type      string `json:"type"`      // Status type
+	Value     int64  `json:"value"`     // Value for gauge type
+	Count     int64  `json:"count"`     // Count for timer type
+	TotalTime int64  `json:"totalTime"` // Total time used to perform action for timer type
 }
 
 type Alerta struct {
 	Urls            []string
 	ResponseTimeout config.Duration
 	tls.ClientConfig
+
+	Headers map[string]string `toml:"headers"`
+
+	// HTTP Basic Auth Credentials
+	Username config.Secret `toml:"username"`
+	Password config.Secret `toml:"password"`
+
+	// Absolute path to file with Bearer token
+	ApiKey config.Secret `toml:"api_key"`
 
 	// HTTP client
 	client *http.Client
@@ -48,30 +58,35 @@ func (*Alerta) SampleConfig() string {
 	return sampleConfig
 }
 
-func (n *Alerta) Gather(acc telegraf.Accumulator) error {
+func (a *Alerta) Gather(acc telegraf.Accumulator) error {
 	var wg sync.WaitGroup
 
 	// Create an HTTP client that is re-used for each
 	// collection interval
-	if n.client == nil {
-		client, err := n.createHTTPClient()
+	if a.client == nil {
+		client, err := a.createHTTPClient()
 		if err != nil {
 			return err
 		}
-		n.client = client
+		a.client = client
 	}
 
-	for _, u := range n.Urls {
+	for _, u := range a.Urls {
 		addr, err := url.Parse(u)
 		if err != nil {
 			acc.AddError(fmt.Errorf("unable to parse address '%s': %s", u, err))
 			continue
 		}
 
+		if addr.Path != "/management/status" {
+			acc.AddError(fmt.Errorf("excpeted '/management/status' at the end of url:' '%s'", u))
+			continue
+		}
+
 		wg.Add(1)
 		go func(addr *url.URL) {
 			defer wg.Done()
-			acc.AddError(n.gatherURL(addr, acc))
+			acc.AddError(a.gatherURL(addr, acc))
 		}(addr)
 	}
 
@@ -79,28 +94,28 @@ func (n *Alerta) Gather(acc telegraf.Accumulator) error {
 	return nil
 }
 
-func (n *Alerta) createHTTPClient() (*http.Client, error) {
-	tlsCfg, err := n.ClientConfig.TLSConfig()
+func (a *Alerta) createHTTPClient() (*http.Client, error) {
+	tlsCfg, err := a.ClientConfig.TLSConfig()
 	if err != nil {
 		return nil, err
 	}
 
-	if n.ResponseTimeout < config.Duration(time.Second) {
-		n.ResponseTimeout = config.Duration(time.Second * 5)
+	if a.ResponseTimeout < config.Duration(time.Second) {
+		a.ResponseTimeout = config.Duration(time.Second * 5)
 	}
 
 	client := &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: tlsCfg,
 		},
-		Timeout: time.Duration(n.ResponseTimeout),
+		Timeout: time.Duration(a.ResponseTimeout),
 	}
 
 	return client, nil
 }
 
-func (n *Alerta) gatherURL(addr *url.URL, acc telegraf.Accumulator) error {
-	resp, err := n.client.Get(addr.String())
+func (a *Alerta) gatherURL(addr *url.URL, acc telegraf.Accumulator) error {
+	resp, err := a.client.Get(addr.String())
 	if err != nil {
 		return fmt.Errorf("error making HTTP request to %s: %s", addr.String(), err)
 	}
@@ -122,6 +137,10 @@ func (n *Alerta) gatherURL(addr *url.URL, acc telegraf.Accumulator) error {
 	var stats = &AlertaStats{}
 	json.Unmarshal(body, stats)
 
+	if len(stats.Version) == 0 {
+		return fmt.Errorf("expected version in response: %s", addr)
+	}
+
 	tags := map[string]string{
 		"url":     addr.String(),
 		"version": stats.Version,
@@ -130,16 +149,22 @@ func (n *Alerta) gatherURL(addr *url.URL, acc telegraf.Accumulator) error {
 	fields := map[string]interface{}{
 		"uptime": stats.Uptime,
 	}
-
+	var fieldName string
 	for _, m := range stats.Met {
+		fieldName = ""
 		if m.Group != "alerts" {
 			continue
 		}
-		fieldName := m.Name + "_" + m.Group
-		if fieldName == "total_alerts" {
-			m.Count = m.Value
+		if m.Type == "timer" {
+			fieldName = m.Name + "_" + m.Group + "_time"
+			fields[fieldName] = m.TotalTime
+
+			fieldName = m.Name + "_" + m.Group
+			fields[fieldName] = m.Count
+		} else if m.Type == "gauge" {
+			fieldName = m.Name + "_" + m.Group
+			fields[fieldName] = m.Value
 		}
-		fields[fieldName] = m.Count
 	}
 
 	acc.AddFields(
